@@ -57,8 +57,14 @@ namespace rooks
         std::vector<Rook> run(const EventHandler& on_event = {});
 
     private:
+        using WaitingTargets     = std::array<std::optional<Square>, max_rooks>;
+        using StuckReportedFlags = std::array<bool, max_rooks>;
+        using EventQueue         = std::deque<Event>;
+
         void worker(std::size_t rook) noexcept;
         void move_rook(std::size_t rook);
+        void wake_all();
+        void wake_unblocked();
         void report_stuck();
         void post(EventKind kind, std::size_t rook, Square from, Square target, Milliseconds pause = {}, Clock::time_point when = Clock::now());
 
@@ -66,18 +72,23 @@ namespace rooks
         const Timing        timing_;
 
         // All mutable state below is protected by mutex_ while workers are running.
-        std::mutex                  mutex_;
-        std::condition_variable     changed_;
-        Board                       board_;
-        std::deque<Event>           events_;
-        std::array<bool, max_rooks> stuck_reported_{};
-        std::exception_ptr          failure_;
-        Clock::time_point           started_at_;
-        std::size_t                 ready_      = 0;
-        std::size_t                 sequence_   = 0;
-        bool                        run_called_ = false;
-        bool                        started_    = false;
-        bool                        stopping_   = false;
+        std::mutex mutex_;
+        // Only run() waits on coordinator_changed_. Each worker has its own CV,
+        // shared by its start gate, blocked-path wait and cooldown.
+        std::condition_variable                        coordinator_changed_;
+        std::array<std::condition_variable, max_rooks> rook_changed_;
+        // Present only during a blocked-path wait; empty during start/cooldown.
+        WaitingTargets     waiting_targets_{};
+        Board              board_;
+        EventQueue         events_;
+        StuckReportedFlags stuck_reported_{};
+        std::exception_ptr failure_;
+        Clock::time_point  started_at_;
+        std::size_t        ready_      = 0;
+        std::size_t        sequence_   = 0;
+        bool               run_called_ = false;
+        bool               started_    = false;
+        bool               stopping_   = false;
     };
 
 } // namespace rooks

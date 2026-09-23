@@ -45,11 +45,11 @@ namespace rooks
             }
 
             std::unique_lock lock(mutex_);
-            changed_.wait(lock,
-                          [this, count]
-                          {
-                              return ready_ == count || failure_;
-                          });
+            coordinator_changed_.wait(lock,
+                                      [this, count]
+                                      {
+                                          return ready_ == count || failure_;
+                                      });
             if (!failure_)
             {
                 started_at_ = Clock::now();
@@ -57,15 +57,15 @@ namespace rooks
                 started_  = true;
                 stopping_ = board_.done();
             }
-            changed_.notify_all();
+            wake_all();
 
             for (;;)
             {
-                changed_.wait(lock,
-                              [this]
-                              {
-                                  return stopping_ || !events_.empty();
-                              });
+                coordinator_changed_.wait(lock,
+                                          [this]
+                                          {
+                                              return stopping_ || !events_.empty();
+                                          });
                 std::deque<Event> pending;
                 pending.swap(events_);
                 lock.unlock();
@@ -91,7 +91,7 @@ namespace rooks
                 std::lock_guard lock(mutex_);
                 stopping_ = true;
             }
-            changed_.notify_all();
+            wake_all();
             throw;
         }
 
@@ -124,7 +124,7 @@ namespace rooks
                 }
                 stopping_ = true;
             }
-            changed_.notify_all();
+            wake_all();
         }
     }
 
@@ -136,13 +136,16 @@ namespace rooks
         std::optional<Square>                            previous_target;
 
         std::unique_lock lock(mutex_);
-        ++ready_;
-        changed_.notify_all();
-        changed_.wait(lock,
-                      [this]
-                      {
-                          return started_ || stopping_;
-                      });
+        // Only the last arrival wakes the coordinator, never the other workers.
+        if (++ready_ == board_.rooks().size())
+        {
+            coordinator_changed_.notify_one();
+        }
+        rook_changed_[rook].wait(lock,
+                                 [this]
+                                 {
+                                     return started_ || stopping_;
+                                 });
 
         const auto& me = board_.rooks()[rook];
         while (!stopping_ && !me.finished())
@@ -156,15 +159,18 @@ namespace rooks
                 const auto deadline     = wait_started + timing_.blocked_timeout;
                 post(EventKind::waiting, rook, me.square, target, {}, wait_started);
 
-                // wait_until atomically releases the mutex and begins waiting.
-                // The predicate handles spurious/unrelated wakeups. Keeping ONE
-                // absolute deadline prevents other moves from extending this wait.
-                const bool available = changed_.wait_until(lock,
-                                                           deadline,
-                                                           [&]
-                                                           {
-                                                               return stopping_ || board_.path_clear(rook, target);
-                                                           });
+                // Register under the board lock, before wait_until releases it:
+                // a move that clears this path cannot slip past our registration.
+                waiting_targets_[rook] = target;
+                // Keep the predicate: another rook can block the path again before
+                // we reacquire the lock. The absolute deadline never restarts.
+                const bool available = rook_changed_[rook].wait_until(lock,
+                                                                      deadline,
+                                                                      [&]
+                                                                      {
+                                                                          return stopping_ || board_.path_clear(rook, target);
+                                                                      });
+                waiting_targets_[rook].reset();
                 if (stopping_)
                 {
                     break;
@@ -188,23 +194,52 @@ namespace rooks
             post(EventKind::moved, rook, from, target, pause, moved_at);
             report_stuck();
             stopping_ = board_.done();
-            changed_.notify_all();
+            if (stopping_)
+            {
+                wake_all();
+            }
+            else
+            {
+                wake_unblocked();
+            }
             if (stopping_ || me.finished())
             {
                 break;
             }
 
-            // Board notifications must not shorten a rook's cooldown. Only game
-            // termination interrupts it. This wait releases the board mutex too.
-            changed_.wait_until(lock,
-                                moved_at + pause,
-                                [this]
-                                {
-                                    return stopping_;
-                                });
+            // No registered target means moves cannot notify this worker during
+            // cooldown. Shutdown still wakes it immediately; no uninterruptible sleep.
+            rook_changed_[rook].wait_until(lock,
+                                           moved_at + pause,
+                                           [this]
+                                           {
+                                               return stopping_;
+                                           });
         }
         // Deliberately no "if (me.stuck) return": stuck rooks keep retrying until
         // the entire game ends, as required. Their five-second waits do not spin.
+    }
+    void Simulation::wake_all()
+    {
+        // Used only to open the start gate or stop the game (including failures).
+        coordinator_changed_.notify_one();
+        for (auto& changed : rook_changed_)
+        {
+            changed.notify_one(); // Exactly one worker can wait on each CV.
+        }
+    }
+    void Simulation::wake_unblocked()
+    {
+        // Caller holds mutex_. At most six targets: a scan is simpler than keeping
+        // dependency lists, and avoids waking workers whose paths are still blocked.
+        for (std::size_t i = 0; i < board_.rooks().size(); ++i)
+        {
+            const auto target = waiting_targets_[i];
+            if (target && board_.path_clear(i, *target))
+            {
+                rook_changed_[i].notify_one();
+            }
+        }
     }
 
     void Simulation::report_stuck()
@@ -224,7 +259,7 @@ namespace rooks
     {
         // Caller holds mutex_. Queue small records here; do all formatting/I/O in run().
         events_.push_back({kind, ++sequence_, rook, from, target, board_.rooks()[rook].moves, pause, when - started_at_});
-        changed_.notify_all();
+        coordinator_changed_.notify_one();
     }
 
 } // namespace rooks
